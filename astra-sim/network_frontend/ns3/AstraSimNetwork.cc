@@ -260,6 +260,8 @@ void parse_args(int argc, char* argv[]) {
                  logical_topology_configuration);
     cmd.AddValue("logging-configuration", "Logging configuration file",
                  logging_configuration);
+    cmd.AddValue("rdma-mode", "Override RDMA_MODE from network config: rdma or mprdma",
+                 rdma_mode_override);
 
     cmd.AddValue("num-queues-per-dim", "Number of queues per each dimension",
                  num_queues_per_dim);

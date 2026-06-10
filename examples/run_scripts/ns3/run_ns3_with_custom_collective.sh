@@ -11,6 +11,10 @@ WORKLOAD="${EXAMPLES_DIR:?}"/workload/microbenchmarks/all_reduce/8npus_1MB/all_r
 SYSTEM="${EXAMPLES_DIR:?}/system/custom_collectives/custom_collective.json"
 NETWORK="${NS3_DIR:?}"/scratch/config/config_clos.txt
 LOGICAL_TOPOLOGY="${EXAMPLES_DIR:?}"/network/ns3/sample_8nodes_1D.json
+RDMA_MODE_ARGS=()
+if [[ -n "${RDMA_MODE:-}" ]]; then
+    RDMA_MODE_ARGS=(--rdma-mode="${RDMA_MODE}")
+fi
 
 MEMORY="${EXAMPLES_DIR:?}"/remote_memory/analytical/no_memory_expansion.json
 COMM_GROUP_CONFIGURATION="empty"
@@ -25,6 +29,7 @@ echo "Running simulation with WORKLOAD: ${WORKLOAD}"
     --network-configuration=${NETWORK} \
     --remote-memory-configuration=${MEMORY} \
     --logical-topology-configuration=${LOGICAL_TOPOLOGY} \
-    --comm-group-configuration=${COMM_GROUP_CONFIGURATION}
+    --comm-group-configuration=${COMM_GROUP_CONFIGURATION} \
+    "${RDMA_MODE_ARGS[@]}"
 
 cd "${SCRIPT_DIR:?}"

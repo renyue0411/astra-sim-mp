@@ -10,6 +10,10 @@ WORKLOAD="${EXAMPLES_DIR:?}"/workload/microbenchmarks/all_gather/16npus_1MB/all_
 SYSTEM="${EXAMPLES_DIR:?}"/system/native_collectives/Ring_4chunks.json
 NETWORK="${NS3_DIR:?}"/scratch/config/config_clos.txt
 LOGICAL_TOPOLOGY="${EXAMPLES_DIR:?}"/network/ns3/sample_16nodes_1D.json
+RDMA_MODE_ARGS=()
+if [[ -n "${RDMA_MODE:-}" ]]; then
+    RDMA_MODE_ARGS=(--rdma-mode="${RDMA_MODE}")
+fi
 
 MEMORY="${EXAMPLES_DIR:?}"/remote_memory/analytical/no_memory_expansion.json
 COMM_GROUP_CONFIGURATION="empty"
@@ -25,6 +29,7 @@ gdb --args \
     --network-configuration=${NETWORK} \
     --remote-memory-configuration=${MEMORY} \
     --logical-topology-configuration=${LOGICAL_TOPOLOGY} \
-    --comm-group-configuration=${COMM_GROUP_CONFIGURATION}
+    --comm-group-configuration=${COMM_GROUP_CONFIGURATION} \
+    "${RDMA_MODE_ARGS[@]}"
 
 cd "${SCRIPT_DIR:?}"

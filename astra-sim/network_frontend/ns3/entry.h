@@ -1,3 +1,4 @@
+#include <cstdio>
 #undef PGO_TRAINING
 #define PATH_TO_PGO_CONFIG "path_to_pgo_config"
 
@@ -13,6 +14,10 @@
 #include "ns3/qbb-helper.h"
 #include <fstream>
 #include <iostream>
+#include <deque>
+#include <ns3/mp-rdma-client-helper.h>
+#include <ns3/mp-rdma-client.h>
+#include <ns3/mp-rdma-driver.h>
 #include <ns3/rdma-client-helper.h>
 #include <ns3/rdma-client.h>
 #include <ns3/rdma-driver.h>
@@ -86,6 +91,13 @@ typedef pair<int, pair<int, int>> MsgEventKey;
 // Verify & Simplify.
 map<pair<int, pair<int, int>>, int> sender_src_port_map;
 
+struct MpSenderFlowInfo {
+  int tag;
+  int src_port;
+};
+
+map<pair<int, pair<int, int>>, deque<MpSenderFlowInfo>> mp_sender_flow_map;
+
 // NodeHash is used to count how many bytes were sent/received by this node.
 // Refer to sim_finish().
 //   - key: Pair <node_id, send/receive>. Where 'send/receive' indicates if the
@@ -124,9 +136,16 @@ map<MsgEventKey, int> received_msg_standby_hash;
 // between two pair of nodes. send_flow is triggered by sim_send.
 void send_flow(int src_id, int dst, int maxPacketCount,
                void (*msg_handler)(void *fun_arg), void *fun_arg, int tag) {
+    static uint64_t diag_send_flow_count = 0;
+    ++diag_send_flow_count;
+    fprintf(stderr, "[DIAG] send_flow #%lu\n",
+            (unsigned long)diag_send_flow_count);
   // Get a new port number.
   uint32_t port = portNumber[src_id][dst]++;
   sender_src_port_map[make_pair(port, make_pair(src_id, dst))] = tag;
+    fprintf(stderr,
+            "[DIAG_FLOW_SEND] src=%d dst=%d sport=%u size=%d tag=%d\n",
+            src_id, dst, port, maxPacketCount, tag);
   int pg = 3, dport = 100;
   flow_input.idx++;
 
@@ -137,15 +156,58 @@ void send_flow(int src_id, int dst, int maxPacketCount,
       make_pair(make_pair(tag, make_pair(send_event.src_id, send_event.dst_id)),port) ;
   sim_send_waiting_hash[send_event_key] = send_event;
 
-  // Create a queue pair and schedule within the ns3 simulator.
-  RdmaClientHelper clientHelper(
-      pg, serverAddress[src_id], serverAddress[dst], port, dport,
-      maxPacketCount,
+  ApplicationContainer appCon;
+  uint32_t win =
       has_win ? (global_t == 1 ? maxBdp : pairBdp[n.Get(src_id)][n.Get(dst)])
-              : 0,
-      global_t == 1 ? maxRtt : pairRtt[src_id][dst], msg_handler, fun_arg, tag,
-      src_id, dst);
-  ApplicationContainer appCon = clientHelper.Install(n.Get(src_id));
+              : 0;
+  // Allow an explicit MPRDMA initial-window override from config_clos.txt.
+  // A value of 0 preserves the original BDP-based behavior.
+  if (use_mprdma && mp_win_bytes > 0) {
+    win = mp_win_bytes;
+  }
+  
+  uint64_t base_rtt = global_t == 1 ? maxRtt : pairRtt[src_id][dst];
+
+  if (use_mprdma) {
+      uint32_t mp_dport = port;
+
+      mp_sender_flow_map[
+          make_pair(mp_dport, make_pair(src_id, dst))
+      ].push_back(
+          MpSenderFlowInfo{
+              tag,
+              static_cast<int>(port)
+          });
+
+      fprintf(
+          stderr,
+          "[MP_WIN] src=%d dst=%d size=%d "
+          "effective_win=%u base_rtt=%llu\n",
+          src_id,
+          dst,
+          maxPacketCount,
+          win,
+          (unsigned long long)base_rtt);
+
+      MpRdmaClientHelper clientHelper(
+          pg,
+          serverAddress[src_id],
+          serverAddress[dst],
+          port,
+          mp_dport,
+          maxPacketCount,
+          win,
+          base_rtt);
+
+      appCon =
+          clientHelper.Install(n.Get(src_id));
+  } else {
+    // Create a queue pair and schedule within the ns3 simulator.
+    RdmaClientHelper clientHelper(
+        pg, serverAddress[src_id], serverAddress[dst], port, dport,
+        maxPacketCount, win, base_rtt, msg_handler, fun_arg, tag, src_id, dst);
+    appCon = clientHelper.Install(n.Get(src_id));
+  }
   appCon.Start(Time(0));
 }
 
@@ -281,13 +343,72 @@ void qp_finish(FILE *fout, Ptr<RdmaQueuePair> q) {
   notify_receiver_receive_data(sid, did, q->m_size, tag);
 }
 
+void mp_qp_finish_print_log(FILE *fout, Ptr<MpRdmaQueuePair> q) {
+  uint32_t sid = ip_to_node_id(q->sip), did = ip_to_node_id(q->dip);
+  uint64_t base_rtt = pairRtt[sid][did], b = pairBw[sid][did];
+  uint32_t total_bytes =
+      q->m_size +
+      ((q->m_size - 1) / packet_payload_size + 1) *
+          (CustomHeader::GetStaticWholeHeaderSize() -
+           IntHeader::GetStaticSize());
+  uint64_t standalone_fct = base_rtt + total_bytes * 8000000000lu / b;
+  fprintf(fout, "%08x %08x %u %u %lu %lu %lu %lu\n", q->sip.Get(),
+          q->dip.Get(), q->sport, q->dport, q->m_size,
+          q->startTime.GetTimeStep(),
+          (Simulator::Now() - q->startTime).GetTimeStep(), standalone_fct);
+  fflush(fout);
+}
+
+void mp_qp_finish(FILE *fout, Ptr<MpRdmaQueuePair> q) {
+    fprintf(stderr,
+            "[DIAG_FLOW_FINISH] src=%u dst=%u sport=%u dport=%u size=%lu\n",
+            ip_to_node_id(q->sip),
+            ip_to_node_id(q->dip),
+            q->sport,
+            q->dport,
+            (unsigned long)q->m_size);
+    static uint64_t diag_mp_qp_finish_count = 0;
+    ++diag_mp_qp_finish_count;
+    fprintf(stderr, "[DIAG] mp_qp_finish #%lu\n",
+            (unsigned long)diag_mp_qp_finish_count);
+  uint32_t sid = ip_to_node_id(q->sip), did = ip_to_node_id(q->dip);
+  mp_qp_finish_print_log(fout, q);
+
+  Ptr<Node> dstNode = n.Get(did);
+  Ptr<MpRdmaDriver> rdma = dstNode->GetObject<MpRdmaDriver>();
+  rdma->m_rdma->DeleteRxQp(q->sip.Get(), q->dport, q->m_pg);
+
+  auto key = make_pair(static_cast<int>(q->dport), make_pair((int)sid, (int)did));
+  auto it = mp_sender_flow_map.find(key);
+  if (it == mp_sender_flow_map.end() || it->second.empty()) {
+    cout << "could not find the MP-RDMA tag, there must be something wrong"
+         << endl;
+    exit(-1);
+  }
+
+  MpSenderFlowInfo flow_info = it->second.front();
+  it->second.pop_front();
+  if (it->second.empty()) {
+    mp_sender_flow_map.erase(it);
+  }
+
+  notify_sender_sending_finished(sid, did, q->m_size, flow_info.tag,
+                                 flow_info.src_port);
+  notify_receiver_receive_data(sid, did, q->m_size, flow_info.tag);
+}
+
 int setup_ns3_simulation(string network_configuration) {
   if (!ReadConf(network_configuration))
     return -1;
 
+  if (!ApplyRdmaMode())
+    return -1;
+
+  cout << "Using RDMA mode: " << rdma_mode << endl;
+
   SetConfig();
 
-  if (!SetupNetwork(qp_finish)) {
+  if (!SetupNetwork(qp_finish, mp_qp_finish)) {
     return -1;
   }
 
